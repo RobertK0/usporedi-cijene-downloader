@@ -1,8 +1,8 @@
 // price-files-downloader.js
-const puppeteer = require("puppeteer");
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
+const cheerio = require("cheerio");
 const { exec } = require("child_process");
 const winston = require("winston");
 
@@ -25,7 +25,7 @@ const logger = winston.createLogger({
 
 // Configuration
 const CONFIG = {
-  url: "https://www.konzum.hr/cjenici", // Replace with actual URL
+  url: "https://www.konzum.hr/cjenici",
   selector: ".js-price-lists-2025-05-15 a.btn",
   downloadDir: path.join(
     __dirname,
@@ -33,9 +33,10 @@ const CONFIG = {
     new Date().toISOString().split("T")[0]
   ), // Daily folder
   maxConcurrentDownloads: 5,
-  pageLoadTimeout: 60000, // 60 seconds
   downloadTimeout: 120000, // 2 minutes per file
   fileProcessingDir: path.join(__dirname, "processing"), // Where files go after download for processing
+  userAgent:
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
 };
 
 // Create download directory if it doesn't exist
@@ -55,56 +56,66 @@ async function setupDirectories() {
   }
 }
 
-// Extract links from the webpage
+// Extract links from HTML using cheerio
 async function extractDownloadLinks() {
-  logger.info(`Starting browser to visit ${CONFIG.url}`);
-
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-accelerated-2d-canvas",
-      "--disable-gpu",
-    ],
-  });
+  logger.info(`Fetching HTML from ${CONFIG.url}`);
 
   try {
-    const page = await browser.newPage();
+    // Fetch the HTML content using axios
+    const response = await axios.get(CONFIG.url, {
+      headers: {
+        "User-Agent": CONFIG.userAgent,
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        Connection: "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+      },
+    });
 
-    // Set longer timeout for page load
-    await page.setDefaultNavigationTimeout(CONFIG.pageLoadTimeout);
+    // Load HTML into cheerio
+    const $ = cheerio.load(response.data);
 
-    logger.info(`Navigating to ${CONFIG.url}`);
-    await page.goto(CONFIG.url, { waitUntil: "networkidle2" });
+    // Find all links matching the selector
+    const links = [];
+    $(CONFIG.selector).each((i, element) => {
+      const url = $(element).attr("href");
+      const text = $(element).text().trim();
+      const downloadAttr = $(element).attr("download");
 
-    // Wait for selector to be available
-    logger.info(`Waiting for selector: ${CONFIG.selector}`);
-    await page.waitForSelector(CONFIG.selector, { timeout: 30000 });
+      // Extract filename from the download attribute, link text, or URL
+      let filename = downloadAttr || text;
+      if (!filename || filename === "") {
+        const urlParts = url.split("/");
+        filename = urlParts[urlParts.length - 1];
+      }
 
-    // Extract all download links
-    const links = await page.evaluate((selector) => {
-      const elements = document.querySelectorAll(selector);
-      return Array.from(elements).map((link) => ({
-        url: link.href,
-        filename:
-          link.getAttribute("download") ||
-          link.textContent.trim() ||
-          link.href.split("/").pop() ||
-          `file-${Date.now()}.csv`,
-      }));
-    }, CONFIG.selector);
+      // If the URL is relative, make it absolute
+      let absoluteUrl = url;
+      if (url.startsWith("/")) {
+        const baseUrl = new URL(CONFIG.url);
+        absoluteUrl = `${baseUrl.protocol}//${baseUrl.host}${url}`;
+      }
+
+      links.push({
+        url: absoluteUrl,
+        filename: filename || `file-${i}.csv`,
+      });
+    });
 
     logger.info(`Found ${links.length} files to download`);
 
-    await browser.close();
+    // Save the list of links for reference and debugging
+    fs.writeFileSync(
+      path.join(CONFIG.downloadDir, "_links.json"),
+      JSON.stringify(links, null, 2)
+    );
+
     return links;
   } catch (error) {
     logger.error(
       `Error extracting download links: ${error.message}`
     );
-    await browser.close();
     throw error;
   }
 }
@@ -126,6 +137,9 @@ async function downloadFile(fileInfo, index) {
       url: url,
       responseType: "stream",
       timeout: CONFIG.downloadTimeout,
+      headers: {
+        "User-Agent": CONFIG.userAgent,
+      },
     });
 
     const writer = fs.createWriteStream(filePath);
@@ -157,7 +171,7 @@ async function downloadFile(fileInfo, index) {
   }
 }
 
-// Process downloads in batches to avoid overloading
+// Download all files
 async function downloadAllFiles(links) {
   const results = {
     success: [],
@@ -281,6 +295,56 @@ function saveMetadata(downloadResults) {
   return metadata;
 }
 
+// Backup option: use curl directly
+async function fetchLinksWithCurl() {
+  logger.info(`Trying to fetch page with curl as a backup method`);
+
+  return new Promise((resolve, reject) => {
+    exec(
+      `curl -A "${CONFIG.userAgent}" -s "${CONFIG.url}"`,
+      async (error, stdout, stderr) => {
+        if (error) {
+          logger.error(`curl error: ${error.message}`);
+          reject(error);
+          return;
+        }
+
+        try {
+          // Parse HTML from curl output
+          const $ = cheerio.load(stdout);
+
+          // Find all links matching the selector
+          const links = [];
+          $(CONFIG.selector).each((i, element) => {
+            const url = $(element).attr("href");
+            const text = $(element).text().trim();
+
+            // Make URL absolute if needed
+            let absoluteUrl = url;
+            if (url.startsWith("/")) {
+              const baseUrl = new URL(CONFIG.url);
+              absoluteUrl = `${baseUrl.protocol}//${baseUrl.host}${url}`;
+            }
+
+            links.push({
+              url: absoluteUrl,
+              filename: text || `file-${i}.csv`,
+            });
+          });
+
+          logger.info(`Found ${links.length} files with curl`);
+          resolve(links);
+        } catch (parseError) {
+          logger.error(
+            `Error parsing curl output: ${parseError.message}`
+          );
+          reject(parseError);
+        }
+      }
+    );
+  });
+}
+
 // Main function
 async function main() {
   logger.info("=== Starting price files download job ===");
@@ -289,8 +353,18 @@ async function main() {
     // Setup directories
     await setupDirectories();
 
-    // Get links from the website
-    const links = await extractDownloadLinks();
+    // Try to get links normally
+    let links = [];
+    try {
+      links = await extractDownloadLinks();
+    } catch (error) {
+      // If normal method fails, try backup curl method
+      logger.warn(
+        `Primary extraction method failed: ${error.message}`
+      );
+      logger.info(`Trying backup method with curl...`);
+      links = await fetchLinksWithCurl();
+    }
 
     if (links.length === 0) {
       logger.warn(
@@ -313,7 +387,7 @@ async function main() {
     );
   } catch (error) {
     logger.error(`Job failed: ${error.message}`);
-    // Could add notification here (email, SMS, etc.) for critical failures
+    // Could add notification here for critical failures
   }
 }
 
