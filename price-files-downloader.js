@@ -26,7 +26,7 @@ const logger = winston.createLogger({
 // Configuration
 const CONFIG = {
   url: "https://www.konzum.hr/cjenici",
-  selector: ".js-price-lists-2025-05-15 a.btn",
+  selector: ".js-price-lists-2025-05-15 a:not(.btn)",
   downloadDir: path.join(
     __dirname,
     "downloads",
